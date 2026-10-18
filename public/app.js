@@ -494,33 +494,182 @@ async function showSquad(id, content) {
   bindShell();
 }
 
+const FALLBACK_FORMATIONS = ["4-4-2", "4-3-3", "3-5-2", "4-2-4", "5-3-2", "3-4-3", "5-4-1", "4-5-1", "3-6-1", "5-2-3"];
+
+function formationSlots(type) {
+  const [defenders = 4, midfielders = 4, forwards = 2] = String(type || "4-4-2").split("-").map(Number);
+  const slots = [];
+  for (const [pos, count] of [[1, 1], [2, defenders], [3, midfielders], [4, forwards]]) {
+    for (let index = 0; index < count; index += 1) slots.push({ pos, playerId: "" });
+  }
+  return slots;
+}
+
+function rosterPlayer(player) {
+  return {
+    id: String(player.pi || player.i || player.id || ""),
+    name: player.n || player.pn || player.name || "Player",
+    pos: Number(player.pos) || 0,
+    pim: player.pim || "",
+    points: player.p ?? player.ap ?? "",
+  };
+}
+
+function placeExisting(slots, players) {
+  const ordered = [...players].sort((a, b) => Number(a.lo ?? 0) - Number(b.lo ?? 0));
+  for (const player of ordered) {
+    const id = String(player.pi || player.i || "");
+    const slot = slots.find((item) => item.pos === Number(player.pos) && !item.playerId);
+    if (slot && id) slot.playerId = id;
+  }
+  return slots;
+}
+
+function keepPlayersForFormation(slots, type) {
+  const kept = { 1: [], 2: [], 3: [], 4: [] };
+  for (const slot of slots) {
+    if (slot.playerId) kept[slot.pos].push(slot.playerId);
+  }
+  const next = formationSlots(type);
+  const cursor = { 1: 0, 2: 0, 3: 0, 4: 0 };
+  for (const slot of next) {
+    slot.playerId = kept[slot.pos][cursor[slot.pos]] || "";
+    cursor[slot.pos] += 1;
+  }
+  return next;
+}
+
 async function showEleven(id, content) {
-  const data = await api(`/v4/leagues/${id}/teamcenter/myeleven`);
-  const players = listsIn(data);
-  const groups = { 1: [], 2: [], 3: [], 4: [] };
-  for (const player of players) {
-    const line = groups[player.pos] || groups[4];
-    line.push(player);
+  const squadPath = userId()
+    ? `/v4/leagues/${id}/managers/${userId()}/squad`
+    : `/v4/leagues/${id}/squad`;
+  const [overview, selectable, squad, me, config] = await Promise.all([
+    api(`/v4/leagues/${id}/lineup/overview`).catch(() => ({ lp: [], t: "4-4-2" })),
+    api(`/v4/leagues/${id}/lineup`).catch(() => ({ it: [] })),
+    api(squadPath).catch(() => ({ it: [] })),
+    cached(`/v4/leagues/${id}/me`, `me:${id}`).catch(() => null),
+    api("/v4/config", { auth: false }).catch(() => null),
+  ]);
+  const competition = (config?.cps || []).find((item) => String(item.cpi) === String(me?.cpi));
+  const formations = competition?.lts?.length ? competition.lts : FALLBACK_FORMATIONS;
+  const type = formations.includes(overview.t) ? overview.t : (overview.t || formations[0]);
+  const roster = new Map();
+  for (const player of [...listsIn(selectable), ...listsIn(squad), ...(overview.lp || [])]) {
+    const item = rosterPlayer(player);
+    if (item.id) roster.set(item.id, { ...roster.get(item.id), ...item });
   }
-  const known = [1, 2, 3, 4].filter((pos) => groups[pos]?.length);
-  if (!players.length) {
-    content.innerHTML = `<p class="muted">No eleven was returned. Open Squad to see the full roster.</p>`;
-    return;
+  const draft = state.lineupDraft;
+  if (!draft || draft.leagueId !== id || !draft.dirty) {
+    state.lineupDraft = {
+      leagueId: id,
+      type,
+      formations,
+      slots: placeExisting(formationSlots(type), overview.lp || []),
+      roster: [...roster.values()],
+      selected: 0,
+      dirty: false,
+    };
+  } else {
+    draft.roster = [...roster.values()];
+    draft.formations = formations;
   }
+  renderEleven(id, content);
+}
+
+function renderEleven(id, content) {
+  const draft = state.lineupDraft;
+  const byId = new Map(draft.roster.map((player) => [player.id, player]));
+  const selected = draft.slots[draft.selected] || draft.slots[0];
+  const taken = new Set(draft.slots.map((slot) => slot.playerId).filter(Boolean));
+  const choices = draft.roster.filter((player) => player.pos === selected?.pos && (player.id === selected?.playerId || !taken.has(player.id)));
+  const lines = [4, 3, 2, 1].map((pos) => draft.slots.map((slot, index) => ({ slot, index })).filter((item) => item.slot.pos === pos));
+  const filled = draft.slots.filter((slot) => slot.playerId).length;
   content.innerHTML = `
-    <div class="pitch">
-      ${(known.length ? known : [0]).map((pos) => `
+    <div class="row eleven-bar">
+      <label for="formation">Formation</label>
+      <select id="formation">
+        ${draft.formations.map((item) => `<option value="${escapeHtml(item)}" ${item === draft.type ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+        ${draft.formations.includes(draft.type) ? "" : `<option value="${escapeHtml(draft.type)}" selected>${escapeHtml(draft.type)}</option>`}
+      </select>
+      <span class="muted">${filled}/11</span>
+      <button class="primary" id="save-lineup" type="button" ${filled === 11 ? "" : "disabled"}>Save eleven</button>
+    </div>
+    <p class="muted">Pick a position, then choose a squad player who plays there. Goalkeepers only fill the goal, and the other lines work the same way.</p>
+    <div class="pitch" id="pitch">
+      ${lines.map((line) => `
         <div class="line">
-          ${(groups[pos] || players).map((player) => `
-            <button class="chip" data-go="#/league/${id}/player/${escapeHtml(playerId(player))}">
-              ${photo(player.pim, "chip-photo")}
-              <strong>${escapeHtml(playerName(player))}</strong>
-              <span>${escapeHtml(positionLabel(player))} · ${text(player.p)} pts</span>
-            </button>`).join("")}
+          ${line.map(({ slot, index }) => {
+            const player = byId.get(slot.playerId);
+            return `<button type="button" class="chip slot ${index === draft.selected ? "active" : ""}" data-slot="${index}">
+              ${player ? photo(player.pim, "chip-photo") : ""}
+              <strong>${escapeHtml(player ? player.name : POSITIONS[slot.pos])}</strong>
+              <span>${escapeHtml(POSITIONS[slot.pos] || "")}${player ? ` · ${text(player.points)} pts` : ""}</span>
+            </button>`;
+          }).join("")}
         </div>`).join("")}
     </div>
-    ${playerTable(players, id, "Matchday eleven")}`;
-  bindShell();
+    <div class="picker">
+      <h3>${escapeHtml(POSITIONS[selected?.pos] || "Position")} options</h3>
+      <div class="picker-list">
+        ${selected?.playerId ? `<button type="button" class="ghost" id="clear-slot">Remove</button>` : ""}
+        ${choices.map((player) => `
+          <button type="button" class="chip ${player.id === selected?.playerId ? "active" : ""}" data-pick="${escapeHtml(player.id)}">
+            ${photo(player.pim, "chip-photo")}
+            <strong>${escapeHtml(player.name)}</strong>
+            <span>${text(player.points)} pts</span>
+          </button>`).join("") || `<p class="muted">No spare ${escapeHtml(POSITIONS[selected?.pos] || "players")} in the squad.</p>`}
+      </div>
+    </div>`;
+  const formation = document.querySelector("#formation");
+  formation.onchange = () => {
+    draft.type = formation.value;
+    draft.slots = keepPlayersForFormation(draft.slots, draft.type);
+    draft.selected = Math.min(draft.selected, draft.slots.length - 1);
+    draft.dirty = true;
+    renderEleven(id, content);
+  };
+  document.querySelectorAll("[data-slot]").forEach((button) => {
+    button.onclick = () => {
+      draft.selected = Number(button.dataset.slot);
+      renderEleven(id, content);
+    };
+  });
+  document.querySelectorAll("[data-pick]").forEach((button) => {
+    button.onclick = () => {
+      const slot = draft.slots[draft.selected];
+      if (!slot) return;
+      for (const other of draft.slots) {
+        if (other.playerId === button.dataset.pick) other.playerId = "";
+      }
+      slot.playerId = button.dataset.pick;
+      draft.dirty = true;
+      renderEleven(id, content);
+    };
+  });
+  const clear = document.querySelector("#clear-slot");
+  if (clear) {
+    clear.onclick = () => {
+      draft.slots[draft.selected].playerId = "";
+      draft.dirty = true;
+      renderEleven(id, content);
+    };
+  }
+  document.querySelector("#save-lineup").onclick = async () => {
+    const players = draft.slots.map((slot) => slot.playerId);
+    if (players.some((playerId) => !playerId)) return;
+    try {
+      await api(`/v4/leagues/${id}/lineup`, {
+        method: "POST",
+        body: { type: draft.type, players },
+      });
+      draft.dirty = false;
+      state.notice = "Eleven saved.";
+      render();
+    } catch (error) {
+      state.error = error.message;
+      render();
+    }
+  };
 }
 
 function playerTable(players, leagueId, title, mode) {

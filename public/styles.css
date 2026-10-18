@@ -124,6 +124,14 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; letter-spacing: 0.0
   font-size: 13px;
 }
 .chip strong { display: block; }
+.chip.slot { min-height: 92px; }
+.chip.active { outline: 2px solid var(--accent-2); }
+.eleven-bar { flex-wrap: wrap; margin-bottom: 8px; }
+.eleven-bar select { width: auto; min-width: 120px; }
+.eleven-bar label { margin: 0; }
+.picker { margin-top: 14px; }
+.picker-list { display: flex; gap: 8px; flex-wrap: wrap; }
+.picker .chip { width: auto; min-width: 108px; }
 .split { display: grid; grid-template-columns: 1.4fr 0.8fr; gap: 14px; }
 .offer { display: flex; gap: 8px; }
 .offer input { width: 120px; }
