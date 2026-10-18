@@ -1,6 +1,13 @@
 const app = document.querySelector("#app");
 const SESSION_KEY = "league-desk-session";
 const POSITIONS = { 1: "GK", 2: "DEF", 3: "MID", 4: "FWD" };
+const START_CHANCE = {
+  1: { label: "Certain", tone: "high", level: 100 },
+  2: { label: "Likely", tone: "mid", level: 75 },
+  3: { label: "Uncertain", tone: "mid", level: 50 },
+  4: { label: "Unlikely", tone: "low", level: 28 },
+  5: { label: "Ruled out", tone: "out", level: 10 },
+};
 
 const state = {
   session: loadSession(),
@@ -115,6 +122,10 @@ function playerId(player) {
 
 function positionLabel(player) {
   return POSITIONS[player.pos] || (player.pos ? `P${player.pos}` : "");
+}
+
+function startChance(value) {
+  return START_CHANCE[Number(value)] || null;
 }
 
 function imageUrl(path) {
@@ -270,8 +281,11 @@ function shell(content) {
     <div class="shell">
       <header class="top">
         <div class="brand">
-          <strong>League desk</strong>
-          <span>${escapeHtml(user?.name || user?.email || "Kickbase account")}</span>
+          <span class="mark" aria-hidden="true"></span>
+          <span class="brand-copy">
+            <strong>League desk</strong>
+            <small>${escapeHtml(user?.name || user?.email || "Kickbase account")}</small>
+          </span>
         </div>
         <nav class="nav">
           <button data-go="#/leagues" class="${state.route.startsWith("#/league") || state.route.startsWith("#/leagues") ? "active" : ""}">Leagues</button>
@@ -290,7 +304,13 @@ function shell(content) {
 
 function bindShell() {
   document.querySelectorAll("[data-go]").forEach((button) => {
-    button.onclick = () => go(button.dataset.go);
+    button.onclick = () => {
+      const next = button.dataset.go || "";
+      if (next.includes("/player/") && state.route.includes("/league/") && !state.route.includes("/player/")) {
+        state.playerBack = state.route;
+      }
+      go(next);
+    };
   });
   const logout = document.querySelector("#logout");
   if (logout) logout.onclick = () => { saveSession(null); go("#/login"); };
@@ -369,18 +389,34 @@ async function loadLeagues() {
   }
 }
 
+function playerBackTarget(leagueId) {
+  const back = state.playerBack || "";
+  if (back.startsWith(`#/league/${leagueId}/`) && !back.includes("/player/")) return back;
+  return `#/league/${leagueId}/squad`;
+}
+
+function playerBackLabel(target) {
+  if (target.endsWith("/players")) return "Back to search";
+  if (target.endsWith("/market")) return "Back to market";
+  if (target.endsWith("/eleven")) return "Back to eleven";
+  if (target.endsWith("/ranking")) return "Back to ranking";
+  if (target.endsWith("/matches")) return "Back to matches";
+  if (target.endsWith("/overview")) return "Back to overview";
+  return "Back to squad";
+}
+
 function leagueShell(parts) {
   const id = parts[1];
   if (parts[2] === "player") {
+    const back = playerBackTarget(id);
     return `
-      <section class="section">
-        <button class="ghost" data-go="#/league/${id}/squad">Back to squad</button>
-        <h2 id="league-title">Player</h2>
+      <section class="section player-page">
+        <button class="ghost" data-go="${back}">${playerBackLabel(back)}</button>
         <div id="content"><p class="muted">Loading player…</p></div>
       </section>`;
   }
   const tab = parts[2] || "overview";
-  const tabs = ["overview", "ranking", "squad", "eleven", "market", "matches"];
+  const tabs = ["overview", "ranking", "squad", "eleven", "market", "players", "matches"];
   return `
     <section class="section">
       <h2 id="league-title">League</h2>
@@ -408,6 +444,7 @@ async function loadLeague(parts) {
     else if (tab === "squad") await showSquad(id, content);
     else if (tab === "eleven") await showEleven(id, content);
     else if (tab === "market") await showMarket(id, content, me);
+    else if (tab === "players") await showPlayers(id, me, content);
     else if (tab === "matches") await showMatches(id, me, content);
     else await showOverview(id, me, content);
   } catch (error) {
@@ -512,6 +549,7 @@ function rosterPlayer(player) {
     pos: Number(player.pos) || 0,
     pim: player.pim || "",
     points: player.p ?? player.ap ?? "",
+    chance: startChance(player.prob),
   };
 }
 
@@ -604,6 +642,7 @@ function renderEleven(id, content) {
               ${player ? photo(player.pim, "chip-photo") : ""}
               <strong>${escapeHtml(player ? player.name : POSITIONS[slot.pos])}</strong>
               <span>${escapeHtml(POSITIONS[slot.pos] || "")}${player ? ` · ${text(player.points)} pts` : ""}</span>
+              ${player?.chance ? `<em class="chance ${player.chance.tone}">${escapeHtml(player.chance.label)}</em>` : ""}
             </button>`;
           }).join("")}
         </div>`).join("")}
@@ -690,6 +729,90 @@ async function showMarket(id, content, me) {
     <p class="muted">Budget ${money(me.b)}. These players belong to other managers. Open one to place a buy offer. To sell someone from your own squad, use Sell on the Squad tab.</p>
     ${playerTable(players, id, "Transfer market", "market")}`;
   bindShell();
+}
+
+async function showPlayers(id, me, content) {
+  const competitionId = me?.cpi;
+  if (!competitionId) {
+    content.innerHTML = `<p class="muted">This league has no competition id, so player search is unavailable.</p>`;
+    return;
+  }
+  const squadPath = userId()
+    ? `/v4/leagues/${id}/managers/${userId()}/squad`
+    : `/v4/leagues/${id}/squad`;
+  const [table, squad] = await Promise.all([
+    cached(`/v4/competitions/${competitionId}/table`, `table:${competitionId}`).catch(() => null),
+    api(squadPath).catch(() => null),
+  ]);
+  const clubs = {};
+  for (const club of listsIn(table)) {
+    if (club?.tid != null) clubs[String(club.tid)] = club.tn || "";
+  }
+  const ownedIds = new Set(listsIn(squad).map((player) => String(playerId(player))));
+  const stored = state.playerQuery?.[id] || "";
+  content.innerHTML = `
+    <form class="search" id="player-search">
+      <label for="player-query">Find a player</label>
+      <input id="player-query" value="${escapeHtml(stored)}" placeholder="Name" autocomplete="off" enterkeyhint="search">
+      <p class="muted">Searches the whole competition, including players who are not in your squad and not on the market.</p>
+    </form>
+    <div id="player-results"></div>`;
+  const input = document.querySelector("#player-query");
+  let ticket = 0;
+  const run = async () => {
+    const current = ++ticket;
+    const query = input.value.trim();
+    state.playerQuery = { ...state.playerQuery, [id]: input.value };
+    const results = document.querySelector("#player-results");
+    if (!results) return;
+    if (query.length < 2) {
+      results.innerHTML = `<p class="muted">Type at least two letters.</p>`;
+      return;
+    }
+    results.innerHTML = `<p class="muted">Searching…</p>`;
+    try {
+      const data = await api(`/v4/competitions/${competitionId}/players/search?leagueId=${encodeURIComponent(id)}&query=${encodeURIComponent(query)}&start=0&max=25`);
+      if (current !== ticket || !document.body.contains(results)) return;
+      const players = listsIn(data);
+      results.innerHTML = players.length
+        ? `<div class="table-wrap">
+            <table>
+              <thead><tr><th>Pos</th><th>Player</th><th>Club</th><th>Value</th><th></th></tr></thead>
+              <tbody>${players.map((player) => {
+                const playerKey = String(playerId(player));
+                const owned = ownedIds.has(playerKey);
+                const listed = Boolean(player.iotm);
+                const owner = player.onm && player.onm !== "Kickbase" ? player.onm : "";
+                const where = owned ? "Your squad" : listed ? "On market" : owner ? `Not listed · ${owner}` : "Not listed";
+                return `<tr>
+                  <td><span class="pos">${escapeHtml(positionLabel(player))}</span></td>
+                  <td><button class="ghost player-link" data-go="#/league/${id}/player/${escapeHtml(playerKey)}">${photo(player.pim)}<span>${escapeHtml(playerName(player))}</span></button></td>
+                  <td>${escapeHtml(clubs[String(player.tid)] || "")}</td>
+                  <td>${money(player.mv)}</td>
+                  <td>${escapeHtml(where)}</td>
+                </tr>`;
+              }).join("")}</tbody>
+            </table>
+          </div>`
+        : `<p class="muted">No players match that name.</p>`;
+      bindShell();
+    } catch (error) {
+      if (current !== ticket || !document.body.contains(results)) return;
+      results.innerHTML = `<div class="banner">${escapeHtml(error.message)}</div>`;
+    }
+  };
+  input.oninput = () => {
+    clearTimeout(state.playerSearchTimer);
+    state.playerSearchTimer = setTimeout(run, 250);
+  };
+  document.querySelector("#player-search").onsubmit = (event) => {
+    event.preventDefault();
+    clearTimeout(state.playerSearchTimer);
+    run();
+  };
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+  run();
 }
 
 async function showMatches(id, me, content) {
@@ -859,26 +982,39 @@ function valueView(data, timeframe, leagueId, playerIdValue) {
 function transferView(player, transfer, owned) {
   const offers = Array.isArray(transfer?.ofs) ? transfer.ofs : [];
   const listed = Boolean(owned && (transfer?.iotm || transfer?.iposl || player?.iposl || transfer?.prc));
+  const onMarket = Boolean(transfer?.iotm || transfer?.ipl || transfer?.iposl || player?.iotm || player?.iposl);
   const expires = countdown(transfer?.exs);
   const yourOffer = !owned && transfer?.uoid;
   const priceField = `<label for="offer-price">Price</label><input id="offer-price" inputmode="numeric" autocomplete="off" required value="${escapeHtml(groupedDigits(player?.mv || ""))}">`;
   let form = "";
+  let heading = "Lookup";
+  let note = `Market value ${money(player?.mv || transfer?.mv)}. This player is not listed, so there is nothing to buy.`;
   if (owned && listed) {
+    heading = "Sell player";
+    note = "This player is in your squad, so the price is what other managers can offer.";
     form = `
       <p>Listed for <strong>${money(transfer?.prc)}</strong>${expires ? ` · ${escapeHtml(expires)} left` : ""}</p>
       <button class="danger" id="unlist" type="button">Remove from market</button>`;
   } else if (owned) {
+    heading = "Sell player";
+    note = "This player is in your squad, so the price is what other managers can offer.";
     form = `<form id="sell-form">${priceField}<button class="primary" type="submit">List for sale</button></form>`;
   } else if (yourOffer) {
+    heading = "Buy player";
+    note = `Owner ${transfer?.onm || player?.onm || "–"}`;
     form = `<p>Your offer: <strong>${money(transfer.uop)}</strong></p><button class="danger" id="withdraw" type="button">Withdraw offer</button>`;
-  } else {
+  } else if (onMarket) {
+    heading = "Buy player";
+    note = `Owner ${transfer?.onm || player?.onm || "–"}`;
     form = `<form id="buy-form">${priceField}<button class="primary" type="submit">Place offer</button></form><p class="muted">Budget stays on the market. ${expires ? `${escapeHtml(expires)} left on this listing.` : ""}</p>`;
+  } else {
+    form = `<p>Not listed on the market.</p>`;
   }
   return `
     <div class="split">
       <article class="card">
-        <h3>${owned ? "Sell player" : "Buy player"}</h3>
-        <p class="muted">${owned ? "This player is in your squad, so the price is what other managers can offer." : `Owner ${escapeHtml(transfer?.onm || player?.onm || "–")}`}</p>
+        <h3>${heading}</h3>
+        <p class="muted">${escapeHtml(note)}</p>
         ${form}
       </article>
       <article class="card">
@@ -910,7 +1046,7 @@ function overviewView(player, names) {
     <article class="card status-card">
       <h3>${escapeHtml(statusLabel(player))}</h3>
       <p class="muted">${escapeHtml(relativeTime(player.ts || player.dt))}</p>
-      ${player.prob != null ? `<div class="meter"><span style="width:${Math.max(0, Math.min(100, Number(player.prob)))}%"></span></div><span class="muted">Start probability ${text(player.prob)}%</span>` : ""}
+      ${chanceMeter(player)}
     </article>`;
 }
 
@@ -969,6 +1105,7 @@ async function showPlayer(leagueId, id, tab, content, range) {
           ${player.shn ? `<span>No. ${escapeHtml(player.shn)}</span>` : ""}
           ${photo(player.tim, "crest")}
           <span>${escapeHtml(player.tn || "")}</span>
+          <span class="nation" id="nation" hidden></span>
         </div>
       </div>
       <button class="ghost" id="scout">${scouted ? "Scouted" : "Scout"}</button>
@@ -976,9 +1113,92 @@ async function showPlayer(leagueId, id, tab, content, range) {
     <div class="tabs">
       ${tabs.map(([name, label]) => `<button data-go="#/league/${leagueId}/player/${id}/${name}" class="${actualTab === name ? "active" : ""}">${label}</button>`).join("")}
     </div>
-    ${panel}`;
+    ${panel}
+    ${actualTab === "overview" ? `<section class="news-block" id="player-news"><p class="muted">Loading Ligainsider news…</p></section>` : ""}`;
   bindShell();
   bindPlayerActions(leagueId, id, owned, scouted, transfer);
+  loadLigainsider(player, `${leagueId}:${id}`, actualTab === "overview");
+}
+
+function chanceMeter(player) {
+  const chance = startChance(player.prob);
+  if (!chance) return "";
+  return `<div class="meter ${chance.tone}"><span style="width:${chance.level}%"></span></div><span class="muted">Start chance · ${escapeHtml(chance.label)}</span>`;
+}
+
+function newsCard(item) {
+  const image = item.image
+    ? `<img alt="" src="${escapeHtml(item.image)}" onerror="this.remove()">`
+    : "";
+  return `<a class="news-card" href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">
+    ${image}
+    <div>
+      <strong>${escapeHtml(item.title)}</strong>
+      ${item.date ? `<span class="muted">${escapeHtml(item.date)}</span>` : ""}
+      ${item.excerpt ? `<p>${escapeHtml(item.excerpt)}</p>` : ""}
+    </div>
+  </a>`;
+}
+
+function paintNation(data) {
+  const slot = document.querySelector("#nation");
+  if (!slot || !data?.nation?.flag) return;
+  slot.hidden = false;
+  slot.innerHTML = `<img class="flag" alt="" src="${escapeHtml(data.nation.flag)}">${escapeHtml(data.nation.name)}`;
+}
+
+async function loadLigainsider(player, stamp, withNews) {
+  const box = document.querySelector("#player-news");
+  const name = fullName(player);
+  const club = player.tn || "";
+  if (!name || name === "Player") {
+    if (box) box.innerHTML = `<p class="muted">No player name to look up on Ligainsider.</p>`;
+    return;
+  }
+  const key = `${foldName(name)}|${foldName(club)}|${withNews ? "full" : "flag"}`;
+  state.newsCache = state.newsCache || {};
+  const paintNews = (data) => {
+    if (!box || state.newsStamp !== stamp || !document.body.contains(box)) return;
+    if (!data?.profile) {
+      box.innerHTML = `<h3>Ligainsider</h3><p class="muted">No matching player profile.</p>`;
+      return;
+    }
+    const items = Array.isArray(data.items) ? data.items.slice(0, 5) : [];
+    box.innerHTML = `
+      <div class="row">
+        <h3>Ligainsider</h3>
+        <a class="ghost" href="${escapeHtml(data.profile)}" target="_blank" rel="noopener noreferrer">Profile</a>
+      </div>
+      ${items.length
+        ? `<div class="news-list">${items.map(newsCard).join("")}</div>`
+        : `<p class="muted">This profile has no news yet.</p>`}`;
+  };
+  const apply = (data) => {
+    if (state.newsStamp !== stamp) return;
+    paintNation(data);
+    if (withNews) paintNews(data);
+  };
+  state.newsStamp = stamp;
+  const cachedNews = state.newsCache[`${foldName(name)}|${foldName(club)}|full`] || state.newsCache[key];
+  if (cachedNews && (withNews ? cachedNews.items?.length || cachedNews.profile : true)) {
+    apply(cachedNews);
+    if (!withNews || cachedNews.items) return;
+  }
+  try {
+    const response = await fetch(`/ligainsider/news?name=${encodeURIComponent(name)}&club=${encodeURIComponent(club)}&items=${withNews ? "1" : "0"}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Ligainsider is unavailable.");
+    state.newsCache[key] = data;
+    if (withNews) state.newsCache[`${foldName(name)}|${foldName(club)}|full`] = data;
+    apply(data);
+  } catch (error) {
+    if (!withNews || state.newsStamp !== stamp || !box || !document.body.contains(box)) return;
+    box.innerHTML = `<h3>Ligainsider</h3><p class="muted">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function foldName(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function forgetPlayer(leagueId, id) {

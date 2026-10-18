@@ -3,6 +3,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { playerNews } from "./ligainsider.mjs";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
 const port = Number(process.env.PORT || 4173);
@@ -26,6 +27,20 @@ function skipRegion(pathname) {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
+  if (url.pathname === "/ligainsider/news" && req.method === "GET") {
+    playerNews({
+      name: url.searchParams.get("name") || "",
+      club: url.searchParams.get("club") || "",
+      withItems: url.searchParams.get("items") !== "0",
+    }).then((data) => {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(data));
+    }).catch((error) => {
+      res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: error.message || "Ligainsider is unavailable." }));
+    });
+    return;
+  }
   if (url.pathname.startsWith("/v4/")) {
     const host = allowedHost(req.headers["x-kickbase-host"]);
     if (!host) {
